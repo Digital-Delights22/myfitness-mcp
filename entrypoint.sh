@@ -1,6 +1,41 @@
 #!/bin/bash
 set -e
 
+# PaaS support (Railway etc.): listen on the platform-assigned $PORT if set.
+if [ -n "${PORT:-}" ]; then
+    export MCP_PORT="$PORT"
+fi
+
+# PaaS support: accept cookies via the MFP_COOKIES env var instead of a mounted
+# file. Value may be JSON ({name: value} or {"cookies": {...}}) or a raw
+# browser Cookie header ("a=1; b=2" - optionally prefixed with "Cookie:").
+if [ -n "${MFP_COOKIES:-}" ]; then
+    export MFP_COOKIES_FILE="${MFP_COOKIES_FILE:-/tmp/mfp_cookies.json}"
+    python - <<'PY'
+import json, os
+raw = os.environ["MFP_COOKIES"].strip()
+try:
+    data = json.loads(raw)
+    cookies = data.get("cookies", data) if isinstance(data, dict) else None
+except json.JSONDecodeError:
+    if raw.lower().startswith("cookie:"):
+        raw = raw[len("cookie:"):]
+    cookies = {}
+    for part in raw.split(";"):
+        if "=" in part:
+            name, value = part.split("=", 1)
+            if name.strip():
+                cookies[name.strip()] = value.strip()
+if not isinstance(cookies, dict) or not cookies:
+    raise SystemExit("ERROR: MFP_COOKIES is set but contains no cookies")
+path = os.environ["MFP_COOKIES_FILE"]
+with open(path, "w") as f:
+    json.dump({"cookies": cookies}, f)
+os.chmod(path, 0o600)
+print(f"Loaded {len(cookies)} MyFitnessPal cookies from MFP_COOKIES")
+PY
+fi
+
 # Validate cookie-source configuration: either a mounted Firefox profile with
 # a cookies.sqlite (directly or one level down), or a JSON cookies file.
 profile_dir="${MFP_FIREFOX_PROFILE_DIR:-}"
