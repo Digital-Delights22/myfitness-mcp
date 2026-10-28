@@ -14,8 +14,9 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_recent_foods` | Read | Recently used foods from the authenticated account |
 | `mfp_get_frequent_foods` | Read | Most-used foods from the authenticated account |
 | `mfp_get_my_foods` | Read | Foods created or saved by the authenticated account |
-| `mfp_get_measurements` | Read | Body measurement history (Weight, Body Fat, ...) |
-| `mfp_set_measurement` | Write | Log a body measurement for today |
+| `mfp_get_measurements` | Read | Body measurement history (Weight, Waist, Hips, ...) with entry ids |
+| `mfp_set_measurement` | Write | Log a body measurement for a date (can add a new type, e.g. Chest) |
+| `mfp_delete_measurement` | Write | Delete a body measurement by `measurement_id` |
 | `mfp_get_exercises` | Read | Logged cardio/strength exercises for a date |
 | `mfp_search_exercises` | Read | Search the public exercise database (strength and cardio) |
 | `mfp_add_exercise` | Write | Log a strength (sets/reps/weight) or cardio (minutes/calories) exercise |
@@ -50,6 +51,12 @@ On success it returns the new food's `mfp_id`; pass that to `mfp_add_food_to_dia
 **`share_public=True` is irreversible** — it submits the food to MyFitnessPal's shared public database, and public foods can no longer be edited or deleted. Leave it `False` (default) to create a private food you can still delete.
 
 > Implementation note: the [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal) library's `set_new_food()` no longer works — MyFitnessPal replaced the server-rendered `/food/new` Rails form with a client-side SPA that has no `authenticity_token` input, so the library's HTML scrape raises `IndexError: list index out of range`. `mfp_create_food` instead POSTs to the `v2/foods` API with the account's bearer token (the same mechanism the library still uses for goals).
+
+### Body measurements
+
+`mfp_set_measurement` takes `measurement`, `value`, an optional `date`, and for Weight a required `unit` (`kg` or `lb`). Other types (accounts start with Neck, Waist and Hips) store a plain number in the account's length unit. Naming a type the account lacks is refused with the list of types; pass `create_type=true` to add it (e.g. Chest, Thigh). The response's `measurement_id` works with `mfp_delete_measurement`; `mfp_get_measurements` (json) lists ids too. MFP shows only the first weight logged on a day, so delete a wrong weight rather than logging a second.
+
+> Implementation note: python-myfitnesspal's measurement methods use the legacy `/measurements/edit` page, which now redirects to `/account/logout` (its set call even reported success after the redirect). These tools use the v2 `/measurements` API instead. That API ignores date-range parameters, so `mfp_get_measurements` filters by date itself, and it answers an unknown type with `200` and no items, which `mfp_set_measurement` treats as a failure.
 
 ### Logging exercise
 
