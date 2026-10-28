@@ -18,6 +18,7 @@ see cookie_loader.
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -776,6 +777,97 @@ class SetWaterInput(BaseModel):
     )
 
 
+class SearchExercisesInput(BaseModel):
+    """Input model for searching the exercise database."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    query: str = Field(
+        ...,
+        description="Exercise name to search for (e.g., 'bench press', 'squat', 'kickboxing')",
+        min_length=1,
+        max_length=200,
+    )
+    limit: int = Field(
+        default=10,
+        description="Maximum number of results to return",
+        ge=1,
+        le=50,
+    )
+
+
+class AddExerciseInput(BaseModel):
+    """Input model for logging an exercise to the diary."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    exercise_id: str = Field(
+        ...,
+        description="MyFitnessPal exercise ID (obtained from mfp_search_exercises)",
+        min_length=1,
+        pattern=r"^\d+$",
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    sets: Optional[int] = Field(
+        default=None, description="Strength: number of sets", ge=1, le=100
+    )
+    reps: Optional[int] = Field(
+        default=None, description="Strength: repetitions per set", ge=1, le=1000
+    )
+    weight: Optional[float] = Field(
+        default=None,
+        description="Strength: weight per set, in weight_unit. Omit for bodyweight exercises.",
+        ge=0,
+        le=2000,
+    )
+    weight_unit: str = Field(
+        default="kg",
+        description="Unit for weight: 'kg' or 'lb'",
+    )
+    minutes: Optional[float] = Field(
+        default=None, description="Cardio: duration in minutes", gt=0, le=1440
+    )
+    calories: Optional[float] = Field(
+        default=None,
+        description="Cardio: calories burned (required for cardio - MyFitnessPal does not compute it)",
+        gt=0,
+        le=20000,
+    )
+    start_time: Optional[str] = Field(
+        default=None,
+        description=(
+            "Cardio: when it started, ISO 8601 with UTC offset (e.g. "
+            "'2026-10-28T18:30:00+07:00'). Defaults to midday UTC on the date."
+        ),
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$",
+    )
+
+
+class DeleteExerciseInput(BaseModel):
+    """Input model for deleting an exercise diary entry."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    entry_id: Optional[str] = Field(
+        default=None,
+        description="Exercise entry ID returned by mfp_add_exercise",
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="Text matched against the names of that day's exercises, used when entry_id is unknown",
+        min_length=1,
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format (used with name). Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+
+
 # ============================================================================
 # Diary Entry Creation Helper Functions
 # ============================================================================
@@ -973,8 +1065,8 @@ def add_food_to_diary(
 
 def remove_diary_entry_v2(client, entry_id: str) -> None:
     """
-    Delete a food diary entry by the UUID the v2 diary API assigned it
-    (what `add_food_to_diary` returns - a different id space than the
+    Delete a food or exercise diary entry by the UUID the v2 diary API
+    assigned it (what `add_food_to_diary` returns - a different id space than the
     legacy numeric entry ids mfp_get_diary shows).
     """
     response = client.session.delete(
@@ -988,6 +1080,248 @@ def remove_diary_entry_v2(client, entry_id: str) -> None:
     raise RuntimeError(
         f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
     )
+
+
+# Exercise logging. The legacy /exercise/add form now bounces POSTs to the
+# login page, and v2 /exercises (search/lookup) needs a scope the web session
+# lacks, so: the exercise catalog comes from the /exercise/lookup page's
+# embedded Next.js data, and entries are written with POST /v2/diary.
+
+EXERCISE_CATALOG_TTL = timedelta(hours=24)
+WEIGHT_UNITS = {
+    "kg": "kilograms", "kgs": "kilograms", "kilogram": "kilograms", "kilograms": "kilograms",
+    "lb": "pounds", "lbs": "pounds", "pound": "pounds", "pounds": "pounds",
+}
+
+_exercise_catalog: Optional[List[Dict[str, str]]] = None
+_exercise_catalog_at: Optional[datetime] = None
+
+
+def parse_exercise_catalog(page_html: str) -> List[Dict[str, str]]:
+    """Extract [{id, name}] from the /exercise/lookup page's __NEXT_DATA__."""
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        page_html,
+        re.S,
+    )
+    if not match:
+        raise RuntimeError("Exercise lookup page has no embedded exercise data")
+    queries = (
+        json.loads(match.group(1))
+        .get("props", {})
+        .get("pageProps", {})
+        .get("dehydratedState", {})
+        .get("queries", [])
+    )
+    for query in queries:
+        data = (query.get("state") or {}).get("data")
+        if isinstance(data, dict) and isinstance(data.get("exercises"), list):
+            return [
+                {"id": str(e["id"]), "name": e["description"]}
+                for e in data["exercises"]
+                if e.get("id") and e.get("description")
+            ]
+    raise RuntimeError("Exercise lookup page did not include the exercise list")
+
+
+def get_exercise_catalog(client) -> List[Dict[str, str]]:
+    """MFP's public exercise list (about 570 entries), cached for a day."""
+    global _exercise_catalog, _exercise_catalog_at
+
+    now = datetime.now()
+    if _exercise_catalog and _exercise_catalog_at and now - _exercise_catalog_at < EXERCISE_CATALOG_TTL:
+        return _exercise_catalog
+    response = client.session.get(f"{client.BASE_URL_SECURE}exercise/lookup", timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not load the exercise list: HTTP {response.status_code}")
+    _exercise_catalog = parse_exercise_catalog(response.text)
+    _exercise_catalog_at = now
+    return _exercise_catalog
+
+
+def _name_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def search_exercise_catalog(
+    catalog: List[Dict[str, str]], query: str, limit: int = 10
+) -> List[Dict[str, str]]:
+    """
+    Rank catalog entries against `query`: exact name first, then entries
+    containing every query word, then those containing the most words;
+    ties go to names that start with the first query word ("Bench Press,
+    Barbell" before "Decline Bench Press"), then to shorter names.
+    Words match by prefix either way, so "squats" finds "Squat".
+    """
+    wanted = _name_tokens(query)
+    if not wanted:
+        return []
+    exact = query.strip().lower()
+
+    scored = []
+    for exercise in catalog:
+        tokens = _name_tokens(exercise["name"])
+        hits = sum(
+            1 for w in wanted if any(t.startswith(w) or w.startswith(t) for t in tokens)
+        )
+        if hits:
+            is_exact = exercise["name"].lower() == exact
+            leads = tokens[0].startswith(wanted[0]) or wanted[0].startswith(tokens[0])
+            scored.append(((not is_exact, -hits, not leads, len(exercise["name"])), exercise))
+    scored.sort(key=lambda pair: pair[0])
+    return [exercise for _, exercise in scored[:limit]]
+
+
+def _v2_error_detail(response) -> str:
+    try:
+        body = response.json()
+        return body.get("error_details", {}).get("item_error") or body.get(
+            "error_description", ""
+        )
+    except Exception:
+        return ""
+
+
+def add_exercise_to_diary(
+    client,
+    exercise_id: str,
+    target_date: date,
+    sets: Optional[int] = None,
+    reps: Optional[int] = None,
+    weight: Optional[float] = None,
+    weight_unit: str = "kg",
+    minutes: Optional[float] = None,
+    calories: Optional[float] = None,
+    start_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Log a strength (sets + reps [+ weight]) or cardio (minutes + calories)
+    exercise. Returns the created v2 diary item, whose `id` is the entry UUID.
+
+    MFP requires a start time on cardio entries (it uses it to avoid double
+    counting against step trackers). Midday UTC keeps the entry on the same
+    calendar day for any account timezone between UTC-11 and UTC+11.
+
+    Raises:
+        RuntimeError: On invalid arguments or if MyFitnessPal rejects the entry
+    """
+    strength = sets is not None or reps is not None or weight is not None
+    cardio = minutes is not None or calories is not None
+    if strength == cardio:
+        raise RuntimeError(
+            "Give either sets and reps (strength) or minutes and calories (cardio)"
+        )
+
+    entry: Dict[str, Any] = {
+        "type": "exercise_entry",
+        "date": target_date.strftime("%Y-%m-%d"),
+        "exercise": {"id": str(exercise_id)},
+    }
+    if strength:
+        if sets is None or reps is None:
+            raise RuntimeError("Strength exercises need both sets and reps")
+        unit = WEIGHT_UNITS.get(weight_unit.strip().lower())
+        if unit is None:
+            raise RuntimeError(f"Unknown weight unit {weight_unit!r}; use 'kg' or 'lb'")
+        entry.update(
+            sets=int(sets),
+            reps_per_set=int(reps),
+            weight_per_set={"unit": unit, "value": float(weight or 0)},
+        )
+    else:
+        if minutes is None or calories is None:
+            raise RuntimeError("Cardio exercises need both minutes and calories")
+        entry.update(
+            start_time=start_time or f"{target_date.strftime('%Y-%m-%d')}T12:00:00+00:00",
+            duration=int(round(minutes * 60)),
+            energy={"unit": "calories", "value": float(calories)},
+        )
+
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/diary",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [entry]}),
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        detail = _v2_error_detail(response)
+        raise RuntimeError(
+            f"Failed to log exercise: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+
+    item = response.json()["items"][0]
+    logger.info(f"Logged exercise {exercise_id} for {target_date} as entry {item.get('id')}")
+    return item
+
+
+def get_exercise_entries_v2(client, target_date: date) -> List[Dict[str, Any]]:
+    """A day's exercise entries from the v2 diary, with their entry UUIDs."""
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": target_date.strftime("%Y-%m-%d"), "types": "exercise_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read exercise entries: HTTP {response.status_code}")
+    return [
+        item
+        for item in response.json().get("items", [])
+        if item.get("type") == "exercise_entry" and not item.get("is_calorie_adjustment")
+    ]
+
+
+def summarize_exercise_entry(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim a v2 exercise diary item to the fields worth showing."""
+    exercise = item.get("exercise") or {}
+    summary: Dict[str, Any] = {
+        "entry_id": item.get("id"),
+        "name": exercise.get("description"),
+        "type": exercise.get("type"),
+    }
+    if exercise.get("type") == "strength":
+        weight = item.get("weight_per_set") or {}
+        summary.update(
+            sets=item.get("sets"),
+            reps=item.get("reps_per_set"),
+            weight=weight.get("value"),
+            weight_unit=weight.get("unit"),
+        )
+    else:
+        summary.update(
+            minutes=round((item.get("duration") or 0) / 60, 1),
+            calories=(item.get("energy") or {}).get("value"),
+        )
+    return summary
+
+
+def delete_exercise_entry(
+    client, target_date: date, entry_id: Optional[str] = None, name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Delete one exercise entry, by UUID or by a name match on `target_date`.
+
+    Raises:
+        RuntimeError: If nothing or more than one entry matches the name
+    """
+    if entry_id:
+        remove_diary_entry_v2(client, entry_id)
+        return {"entry_id": entry_id}
+    if not name:
+        raise RuntimeError("Give entry_id or name")
+
+    entries = [summarize_exercise_entry(i) for i in get_exercise_entries_v2(client, target_date)]
+    wanted = name.lower()
+    matches = [e for e in entries if wanted in (e["name"] or "").lower()]
+    if len(matches) != 1:
+        listing = "; ".join(f"{e['name']} ({e['entry_id']})" for e in entries) or "none"
+        problem = "No exercise matches" if not matches else "More than one exercise matches"
+        raise RuntimeError(
+            f"{problem} {name!r} on {target_date}. Pass entry_id instead. Entries: {listing}"
+        )
+    remove_diary_entry_v2(client, matches[0]["entry_id"])
+    return matches[0]
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1983,6 +2317,160 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
 
     except Exception as e:
         return f"Error getting exercises: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_search_exercises",
+    annotations={
+        "title": "Search Exercises",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_search_exercises(params: SearchExercisesInput) -> str:
+    """
+    Search MyFitnessPal's public exercise database (strength and cardio).
+
+    Use the returned exercise_id with mfp_add_exercise. Try a shorter or
+    more general query if nothing fits (e.g. 'press' or 'row'). Muay Thai
+    is not listed by name: use 'kickboxing' or 'martial arts'.
+
+    Args:
+        params: SearchExercisesInput containing:
+            - query (str): Exercise name to search for
+            - limit (int): Maximum results (default 10)
+
+    Returns:
+        str: JSON list of matching exercises with exercise_id and name
+    """
+    try:
+        client = get_mfp_client()
+        matches = search_exercise_catalog(get_exercise_catalog(client), params.query, params.limit)
+        return json.dumps(
+            {
+                "query": params.query,
+                "count": len(matches),
+                "results": [{"exercise_id": m["id"], "name": m["name"]} for m in matches],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error searching exercises: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_add_exercise",
+    annotations={
+        "title": "Log Exercise",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_add_exercise(params: AddExerciseInput) -> str:
+    """
+    Log a strength or cardio exercise to the MyFitnessPal exercise diary.
+
+    Strength: pass sets, reps and (unless bodyweight) weight with weight_unit
+    ('kg' default, or 'lb'). One entry holds one weight, so log sets done at
+    different weights as separate entries. MyFitnessPal counts no calories
+    for strength entries.
+
+    Cardio: pass minutes and calories. MyFitnessPal requires the calorie
+    figure; use the user's watch reading if they have one, otherwise
+    estimate it. Workouts synced from Apple Health, Garmin or Strava are
+    already in the diary - check mfp_get_exercises first to avoid doubles.
+
+    If MyFitnessPal answers that the exercise needs minutes (or repetitions),
+    the exercise is the other type: retry with the other fields. If it
+    answers "Unknown exercise", that catalog entry is retired: use the next
+    search result.
+
+    Args:
+        params: AddExerciseInput containing:
+            - exercise_id (str): ID from mfp_search_exercises
+            - date (str, optional): YYYY-MM-DD, defaults to today
+            - sets, reps, weight, weight_unit: strength fields
+            - minutes, calories, start_time: cardio fields
+
+    Returns:
+        str: JSON confirmation including entry_id (for mfp_delete_exercise)
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        item = add_exercise_to_diary(
+            client,
+            exercise_id=params.exercise_id,
+            target_date=target_date,
+            sets=params.sets,
+            reps=params.reps,
+            weight=params.weight,
+            weight_unit=params.weight_unit,
+            minutes=params.minutes,
+            calories=params.calories,
+            start_time=params.start_time,
+        )
+        summary = summarize_exercise_entry(item)
+        if params.weight is not None:
+            # MFP stores weight in pounds; echo back what the user said.
+            summary.update(weight=params.weight, weight_unit=params.weight_unit)
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Logged {summary['name']} for {target_date}",
+                "date": str(target_date),
+                **summary,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error logging exercise: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_exercise",
+    annotations={
+        "title": "Delete Exercise Entry",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_exercise(params: DeleteExerciseInput) -> str:
+    """
+    Delete an exercise diary entry.
+
+    Pass the entry_id returned by mfp_add_exercise, or a name (matched
+    against that date's exercises) when the id is not at hand. A name that
+    matches several entries is refused, with every entry listed so you can
+    retry by entry_id.
+
+    Args:
+        params: DeleteExerciseInput containing:
+            - entry_id (str, optional): Entry ID from mfp_add_exercise
+            - name (str, optional): Exercise name text to match
+            - date (str, optional): YYYY-MM-DD for name matching, defaults to today
+
+    Returns:
+        str: JSON confirmation with the deleted entry
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        deleted = delete_exercise_entry(
+            client, target_date, entry_id=params.entry_id, name=params.name
+        )
+        return json.dumps(
+            {"success": True, "message": "Deleted exercise entry", "date": str(target_date), **deleted},
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error deleting exercise: {str(e)}"
 
 
 @mcp.tool(

@@ -17,6 +17,9 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_measurements` | Read | Body measurement history (Weight, Body Fat, ...) |
 | `mfp_set_measurement` | Write | Log a body measurement for today |
 | `mfp_get_exercises` | Read | Logged cardio/strength exercises for a date |
+| `mfp_search_exercises` | Read | Search the public exercise database (strength and cardio) |
+| `mfp_add_exercise` | Write | Log a strength (sets/reps/weight) or cardio (minutes/calories) exercise |
+| `mfp_delete_exercise` | Write | Delete an exercise entry by `entry_id` or by name for a date |
 | `mfp_get_goals` | Read | Daily nutrition goals |
 | `mfp_set_goals` | Write | Update daily nutrition goals |
 | `mfp_get_water` | Read | Water intake for a date |
@@ -47,6 +50,17 @@ On success it returns the new food's `mfp_id`; pass that to `mfp_add_food_to_dia
 **`share_public=True` is irreversible** — it submits the food to MyFitnessPal's shared public database, and public foods can no longer be edited or deleted. Leave it `False` (default) to create a private food you can still delete.
 
 > Implementation note: the [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal) library's `set_new_food()` no longer works — MyFitnessPal replaced the server-rendered `/food/new` Rails form with a client-side SPA that has no `authenticity_token` input, so the library's HTML scrape raises `IndexError: list index out of range`. `mfp_create_food` instead POSTs to the `v2/foods` API with the account's bearer token (the same mechanism the library still uses for goals).
+
+### Logging exercise
+
+`mfp_search_exercises` returns `exercise_id`s from MyFitnessPal's public exercise list (read from the `/exercise/lookup` page and cached for a day). Pass one to `mfp_add_exercise` with either:
+
+- **strength:** `sets`, `reps`, and optional `weight` + `weight_unit` (`kg` default, or `lb`). One entry holds one weight, so log sets at different weights as separate entries. MFP counts no calories for strength entries.
+- **cardio:** `minutes` and `calories` (MFP requires the calorie figure), plus optional `start_time` (ISO 8601 with offset; defaults to midday UTC on the date).
+
+The response includes an `entry_id` for `mfp_delete_exercise`, which also accepts a `name` to match against that day's entries. A few catalog entries are retired and answer `Unknown exercise`; use the next search result.
+
+> Implementation note: the legacy `/exercise/add` form now redirects POSTs to the login page, and the v2 `/exercises` endpoints need a scope the web session lacks, so entries are written with `POST /v2/diary` (`type: exercise_entry`), as food entries are.
 
 ## Authentication: the cookie strategy
 
