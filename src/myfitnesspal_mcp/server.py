@@ -491,7 +491,7 @@ class GetMeasurementsInput(BaseModel):
 
     measurement: str = Field(
         default="Weight",
-        description="Type of measurement to retrieve (e.g., 'Weight', 'Body Fat', 'Waist')",
+        description="Type of measurement to retrieve (e.g., 'Weight', 'Waist', 'Hips', 'Chest')",
     )
     start_date: Optional[str] = Field(
         default=None,
@@ -516,12 +516,43 @@ class SetMeasurementInput(BaseModel):
 
     measurement: str = Field(
         default="Weight",
-        description="Type of measurement to set (e.g., 'Weight', 'Body Fat', 'Waist')",
+        description="Type of measurement to set (e.g., 'Weight', 'Waist', 'Hips', 'Chest')",
     )
     value: float = Field(
         ...,
         description="Measurement value (e.g., 185.5 for weight in lbs)",
         gt=0,
+    )
+    unit: Optional[str] = Field(
+        default=None,
+        description=(
+            "Weight only, and required for it: 'kg' or 'lb'. Other measurements "
+            "are stored as plain numbers in the account's length unit."
+        ),
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    create_type: bool = Field(
+        default=False,
+        description=(
+            "Add the measurement type to the account first if it doesn't exist "
+            "(e.g. 'Chest', 'Thigh'). Only set this when the user asked for that type."
+        ),
+    )
+
+
+class DeleteMeasurementInput(BaseModel):
+    """Input model for deleting a measurement."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    measurement_id: str = Field(
+        ...,
+        description="Measurement ID from mfp_set_measurement or mfp_get_measurements (json)",
+        pattern=r"^\d+$",
     )
 
 
@@ -1322,6 +1353,142 @@ def delete_exercise_entry(
         )
     remove_diary_entry_v2(client, matches[0]["entry_id"])
     return matches[0]
+
+
+# Body measurements. python-myfitnesspal reads and writes these through the
+# legacy /measurements/edit page, which now redirects to /account/logout, so
+# these use the v2 /measurements API the current web client uses. Weight is
+# built in; every other type (Neck, Waist, Hips, or one the user adds) lives
+# in /v2/measurements/types and stores a unitless number.
+
+
+def get_measurement_types(client) -> List[str]:
+    """The account's measurement type names, Weight first."""
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/measurements/types",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read measurement types: HTTP {response.status_code}")
+    return ["Weight"] + [t["description"] for t in response.json().get("items", [])]
+
+
+def resolve_measurement_type(client, name: str, create: bool = False) -> str:
+    """
+    Match `name` to one of the account's types, case-insensitively,
+    optionally adding it when missing.
+
+    Raises:
+        RuntimeError: If the type doesn't exist and `create` is False
+    """
+    types = get_measurement_types(client)
+    for existing in types:
+        if existing.lower() == name.strip().lower():
+            return existing
+    if not create:
+        raise RuntimeError(
+            f"No {name!r} measurement on this account (it has: {', '.join(types)}). "
+            "Pass create_type=true to add it."
+        )
+
+    new_name = name.strip().title()
+    # The endpoint takes a bare list of names and answers with their new ids.
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/measurements/types",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [new_name]}),
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Could not add measurement type {new_name!r}: HTTP {response.status_code}"
+        )
+    logger.info(f"Added measurement type {new_name}")
+    return new_name
+
+
+def set_measurement_v2(
+    client, name: str, value: float, target_date: date, unit: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Log a measurement; `name` must already be resolved. Returns the created
+    item (its `id` is the measurement id).
+
+    Raises:
+        RuntimeError: On a missing weight unit or if MFP stores nothing
+    """
+    item: Dict[str, Any] = {
+        "type": name,
+        "value": float(value),
+        "date": target_date.strftime("%Y-%m-%d"),
+    }
+    if name == "Weight":
+        api_unit = WEIGHT_UNITS.get((unit or "").strip().lower())
+        if api_unit is None:
+            raise RuntimeError("Weight needs unit 'kg' or 'lb'")
+        item["unit"] = api_unit
+
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/measurements",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [item]}),
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        detail = _v2_error_detail(response)
+        raise RuntimeError(
+            f"Failed to log {name}: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+    # MFP answers 200 with no items when it drops the entry (e.g. an
+    # unknown type), so an empty list is a failure, not a success.
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"MyFitnessPal did not store the {name} measurement")
+    logger.info(f"Logged {name} {value} for {target_date}")
+    return items[0]
+
+
+def get_measurements_v2(client, name: str, start: date, end: date) -> Dict[str, Any]:
+    """
+    A type's measurements between two dates, oldest first. The API ignores
+    date-range parameters, so this fetches the type's entries and filters.
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/measurements",
+        params={"types": name},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read {name} measurements: HTTP {response.status_code}")
+    body = response.json()
+    entries = [
+        {
+            "id": str(item["id"]),
+            "date": item["date"],
+            "value": item["value"],
+            "unit": item.get("unit"),
+        }
+        for item in body.get("items", [])
+        if start.isoformat() <= item.get("date", "") <= end.isoformat()
+    ]
+    entries.sort(key=lambda e: e["date"])
+    return {"entries": entries, "has_more": bool(body.get("has_more"))}
+
+
+def delete_measurement_v2(client, measurement_id: str) -> None:
+    response = client.session.delete(
+        f"{MFP_API_BASE}/v2/measurements/{measurement_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Delete failed for measurement {measurement_id}: HTTP {response.status_code}"
+        )
+    logger.info(f"Deleted measurement {measurement_id}")
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -2168,10 +2335,11 @@ async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
 )
 async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
     """
-    Get body measurements (weight, body fat, etc.) over a date range.
+    Get body measurements (weight, waist, hips, etc.) over a date range.
 
     Returns historical measurement data with dates and values. Useful for
-    tracking weight loss progress and body composition changes.
+    tracking weight loss progress and body composition changes. The json
+    format includes each entry's id, for mfp_delete_measurement.
 
     Args:
         params: GetMeasurementsInput containing:
@@ -2192,19 +2360,24 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = client.get_measurements(params.measurement, start, end)
+        name = resolve_measurement_type(client, params.measurement)
+        result = get_measurements_v2(client, name, start, end)
+        entries = result["entries"]
 
         data = {
-            "measurement_type": params.measurement,
+            "measurement_type": name,
             "start_date": str(start),
             "end_date": str(end),
-            "count": len(measurements),
-            "values": ordered_dict_to_dict(measurements),
+            "count": len(entries),
+            "values": {e["date"]: e["value"] for e in entries},
+            "entries": entries,
         }
+        if result["has_more"]:
+            data["note"] = "MyFitnessPal has more entries than it returned; older ones may be missing."
 
         # Calculate summary stats if we have data
-        if measurements:
-            values = list(measurements.values())
+        if entries:
+            values = [e["value"] for e in entries]
             data["summary"] = {
                 "latest": values[-1] if values else None,
                 "earliest": values[0] if values else None,
@@ -2214,9 +2387,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
                 "average": round(sum(values) / len(values), 2),
             }
 
-        return format_response(
-            data, params.response_format, f"{params.measurement} History"
-        )
+        return format_response(data, params.response_format, f"{name} History")
 
     except Exception as e:
         return f"Error getting measurements: {str(e)}"
@@ -2234,35 +2405,81 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
 )
 async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     """
-    Log a new body measurement (weight, body fat, etc.) for today.
+    Log a body measurement (weight, waist, hips, chest, ...) for a date.
 
-    Records the measurement value in MyFitnessPal for tracking progress.
+    Weight needs unit 'kg' or 'lb'. Other measurements are plain numbers
+    shown in the account's length unit (inches or cm, set in MyFitnessPal),
+    so log them in the unit the user measured in and keep it consistent.
+    Accounts start with Weight, Neck, Waist and Hips; when the user names
+    another (e.g. Chest, Thigh, Arm) and the call reports it missing, retry
+    with create_type=true. MyFitnessPal shows only the first weight logged
+    on a day, so delete a wrong weight rather than logging a second one.
 
     Args:
         params: SetMeasurementInput containing:
             - measurement (str): Type of measurement (default 'Weight')
             - value (float): Measurement value (e.g., 185.5)
+            - unit (str, optional): 'kg' or 'lb'; required for Weight
+            - date (str, optional): YYYY-MM-DD, defaults to today
+            - create_type (bool): add a missing measurement type first
 
     Returns:
-        str: Confirmation message with the logged value
+        str: Confirmation including measurement_id (for mfp_delete_measurement)
     """
     try:
         client = get_mfp_client()
-        client.set_measurements(params.measurement, params.value)
+        target_date = parse_date(params.date)
+        name = resolve_measurement_type(client, params.measurement, create=params.create_type)
+        item = set_measurement_v2(client, name, params.value, target_date, params.unit)
 
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully logged {params.measurement}: {params.value}",
-                "measurement": params.measurement,
+                "message": f"Successfully logged {name}: {params.value}",
+                "measurement": name,
                 "value": params.value,
-                "date": str(date.today()),
+                "unit": params.unit if name == "Weight" else None,
+                "date": str(target_date),
+                "measurement_id": str(item.get("id")),
             },
             indent=2,
         )
 
     except Exception as e:
         return f"Error setting measurement: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_measurement",
+    annotations={
+        "title": "Delete Body Measurement",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_measurement(params: DeleteMeasurementInput) -> str:
+    """
+    Delete a logged body measurement by its measurement_id (returned by
+    mfp_set_measurement, or listed by mfp_get_measurements in json format).
+
+    Args:
+        params: DeleteMeasurementInput containing:
+            - measurement_id (str): The measurement to delete
+
+    Returns:
+        str: Confirmation message
+    """
+    try:
+        client = get_mfp_client()
+        delete_measurement_v2(client, params.measurement_id)
+        return json.dumps(
+            {"success": True, "message": "Deleted measurement", "measurement_id": params.measurement_id},
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error deleting measurement: {str(e)}"
 
 
 @mcp.tool(
