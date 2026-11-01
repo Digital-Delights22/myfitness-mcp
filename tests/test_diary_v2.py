@@ -153,3 +153,78 @@ def test_delete_food_entry_routes_v2_uuid_to_v2_api():
             {"headers": server._mfp_api_headers(FakeClient()), "timeout": 30},
         )
     ]
+
+
+def _legacy(meal, name, quantity):
+    return {"meal": meal, "name": name, "quantity": quantity}
+
+
+def _v2(uuid, meal, description, servings=1.0, value=1.0):
+    return {
+        "id": uuid,
+        "type": "food_entry",
+        "meal_name": meal,
+        "servings": servings,
+        "serving_size": {"value": value},
+        "food": {"description": description},
+    }
+
+
+LEGACY_DAY = {
+    "101": _legacy("Lunch", "Thai Delivery - Cashew Chicken with Brown Rice, 1 box", "1"),
+    "201": _legacy("Snacks", 'Apple, 1 medium (3" dia)', "1"),
+    "202": _legacy("Snacks", "Evil Snacks - Mushroom Chips, 2 oz", "2"),
+    "203": _legacy("Snacks", 'Apple, 1 medium (3" dia)', "1"),
+}
+V2_DAY = [
+    _v2("u-lunch", "Lunch", "Thai Delivery - Cashew Chicken with Brown Rice"),
+    _v2("u-apple-1", "Snacks", "Apple"),
+    _v2("u-chips", "Snacks", "Evil Snacks - Mushroom Chips", servings=2.0),
+    _v2("u-apple-2", "Snacks", "Apple"),
+]
+
+
+def test_find_food_entry_uuid_matches_by_meal_and_position():
+    assert server.find_food_entry_uuid(LEGACY_DAY, "101", V2_DAY) == "u-lunch"
+    assert server.find_food_entry_uuid(LEGACY_DAY, "202", V2_DAY) == "u-chips"
+    # Two identical apples: the second legacy entry maps to the second v2 entry.
+    assert server.find_food_entry_uuid(LEGACY_DAY, "203", V2_DAY) == "u-apple-2"
+
+
+def test_find_food_entry_uuid_rejects_name_mismatch():
+    swapped = [V2_DAY[0], V2_DAY[2], V2_DAY[1], V2_DAY[3]]
+    with pytest.raises(RuntimeError, match="Could not match"):
+        server.find_food_entry_uuid(LEGACY_DAY, "201", swapped)
+
+
+def test_find_food_entry_uuid_rejects_quantity_mismatch():
+    v2 = [V2_DAY[0], V2_DAY[1], _v2("u-chips", "Snacks", "Evil Snacks - Mushroom Chips"), V2_DAY[3]]
+    with pytest.raises(RuntimeError, match="quantity"):
+        server.find_food_entry_uuid(LEGACY_DAY, "202", v2)
+
+
+def test_find_food_entry_uuid_rejects_count_mismatch():
+    with pytest.raises(RuntimeError, match="entries"):
+        server.find_food_entry_uuid(LEGACY_DAY, "201", V2_DAY[:3])
+
+
+def test_delete_food_entry_routes_legacy_id_through_v2(monkeypatch):
+    snapshots = [LEGACY_DAY, {k: v for k, v in LEGACY_DAY.items() if k != "203"}]
+    monkeypatch.setattr(server, "get_diary_entry_snapshots", lambda client, d: snapshots.pop(0))
+    monkeypatch.setattr(server, "get_food_entries_v2", lambda client, d: V2_DAY)
+    session = FakeSession(delete=FakeResponse(204))
+
+    deleted = server.delete_food_entry(FakeClient(session), "203", date(2026, 10, 30))
+
+    assert deleted["name"].startswith("Apple")
+    assert [(m, u) for m, u, _ in session.calls] == [
+        ("DELETE", "https://api.myfitnesspal.com/v2/diary/u-apple-2")
+    ]
+
+
+def test_delete_food_entry_fails_if_entry_survives(monkeypatch):
+    monkeypatch.setattr(server, "get_diary_entry_snapshots", lambda client, d: LEGACY_DAY)
+    monkeypatch.setattr(server, "get_food_entries_v2", lambda client, d: V2_DAY)
+    session = FakeSession(delete=FakeResponse(204))
+    with pytest.raises(RuntimeError, match="still exists"):
+        server.delete_food_entry(FakeClient(session), "203", date(2026, 10, 30))

@@ -1113,6 +1113,59 @@ def remove_diary_entry_v2(client, entry_id: str) -> None:
     )
 
 
+def get_food_entries_v2(client, target_date: date) -> List[Dict[str, Any]]:
+    """A day's food entries from the v2 diary, with their entry UUIDs."""
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": target_date.strftime("%Y-%m-%d"), "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read food entries: HTTP {response.status_code}")
+    return [item for item in response.json().get("items", []) if item.get("type") == "food_entry"]
+
+
+def find_food_entry_uuid(
+    legacy_entries: Dict[str, Dict[str, Any]], entry_id: str, v2_items: List[Dict[str, Any]]
+) -> str:
+    """
+    Map a legacy numeric diary entry id (what mfp_get_diary shows) to its v2 UUID.
+
+    The v2 diary carries no legacy ids, but lists each meal's entries in the
+    same order as the diary page, so match by meal and position, then check the
+    food name and quantity agree before trusting the match.
+    """
+    target = legacy_entries[entry_id]
+    meal = (target.get("meal") or "").lower()
+    meal_ids = [eid for eid, entry in legacy_entries.items() if (entry.get("meal") or "").lower() == meal]
+    meal_items = [item for item in v2_items if (item.get("meal_name") or "").lower() == meal]
+    if len(meal_ids) != len(meal_items):
+        raise RuntimeError(
+            f"Could not match entry {entry_id}: {target.get('meal')} has {len(meal_ids)} entries "
+            f"on the diary page but {len(meal_items)} in the v2 diary"
+        )
+
+    item = meal_items[meal_ids.index(entry_id)]
+    description = ((item.get("food") or {}).get("description") or "").lower()
+    if not description or description not in (target.get("name") or "").lower():
+        raise RuntimeError(
+            f"Could not match entry {entry_id}: v2 entry is {description!r}, not {target.get('name')!r}"
+        )
+
+    try:
+        legacy_quantity = float(target.get("quantity"))
+        v2_quantity = float(item.get("servings")) * float((item.get("serving_size") or {}).get("value", 1))
+    except (TypeError, ValueError):
+        legacy_quantity = v2_quantity = None
+    if legacy_quantity is not None and abs(legacy_quantity - v2_quantity) > 0.01:
+        raise RuntimeError(
+            f"Could not match entry {entry_id}: quantity {legacy_quantity} vs {v2_quantity} in the v2 diary"
+        )
+
+    return item["id"]
+
+
 # Exercise logging. The legacy /exercise/add form now bounces POSTs to the
 # login page, and v2 /exercises (search/lookup) needs a scope the web session
 # lacks, so: the exercise catalog comes from the /exercise/lookup page's
@@ -1960,8 +2013,6 @@ def update_food_entry(
 
 def delete_food_entry(client, entry_id: str, target_date: date) -> Dict[str, Any]:
     """Delete an existing diary entry and return the deleted entry snapshot."""
-    from urllib import parse
-
     if not entry_id.isdigit():
         # A v2 diary UUID, as returned by mfp_add_food_to_diary.
         remove_diary_entry_v2(client, entry_id)
@@ -1972,22 +2023,10 @@ def delete_food_entry(client, entry_id: str, target_date: date) -> Dict[str, Any
     if not existing_entry:
         raise RuntimeError(f"Diary entry {entry_id} was not found on {target_date}")
 
-    diary_url = get_diary_page_url(client, target_date)
-    document = get_diary_document(client, target_date)
-    csrf_param, csrf_token = extract_csrf_param_and_token(document)
-    delete_url = parse.urljoin(
-        client.BASE_URL_SECURE,
-        f"food/remove/{entry_id}",
-    )
-
-    response = client.session.post(
-        delete_url,
-        data={"_method": "delete", csrf_param: csrf_token},
-        headers={"Referer": diary_url, "Content-Type": "application/x-www-form-urlencoded"},
-    )
-    response.raise_for_status()
-    if response.status_code not in (200, 204, 302, 303):
-        raise RuntimeError(f"Failed to delete food entry: HTTP {response.status_code}")
+    # The legacy food/remove form now answers 200 without deleting anything, so
+    # find the entry's v2 UUID and delete it through the v2 API instead.
+    v2_entry_id = find_food_entry_uuid(before_entries, entry_id, get_food_entries_v2(client, target_date))
+    remove_diary_entry_v2(client, v2_entry_id)
 
     after_entries = get_diary_entry_snapshots(client, target_date)
     if entry_id in after_entries:
